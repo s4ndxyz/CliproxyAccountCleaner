@@ -29,6 +29,7 @@ import requests
 import aiohttp
 
 HERE = os.path.abspath(os.path.dirname(__file__))
+_TK_BASE = tk.Tk if tk is not None else object
 
 
 def pick_existing_in(base_dir, *names):
@@ -752,8 +753,10 @@ async def delete_names(base_url, token, names, delete_workers, timeout):
     return out
 
 
-class EnhancedUI(tk.Tk):
+class EnhancedUI(_TK_BASE):
     def __init__(self, conf, config_path):
+        if tk is None:
+            raise RuntimeError("当前环境缺少 tkinter，无法启动桌面模式。")
         super().__init__()
         self.title("CliproxyAccountCleaner v1.3.3")
         self.geometry("1220x760")

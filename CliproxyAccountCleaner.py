@@ -239,6 +239,35 @@ def build_quota_payload(auth_index, user_agent, chatgpt_account_id=None):
     }
 
 
+async def _run_bounded(items, limit, make_coro):
+    """Run async jobs with bounded in-flight tasks.
+    Avoid creating one task per item when item count is huge.
+    """
+    limit = max(1, int(limit or 1))
+    it = iter(items or [])
+    running = set()
+    out = []
+
+    for _ in range(limit):
+        try:
+            item = next(it)
+        except StopIteration:
+            break
+        running.add(asyncio.create_task(make_coro(item)))
+
+    while running:
+        done, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            out.append(await task)
+            try:
+                item = next(it)
+            except StopIteration:
+                continue
+            running.add(asyncio.create_task(make_coro(item)))
+
+    return out
+
+
 async def probe_accounts(
     base_url,
     token,
@@ -333,11 +362,12 @@ async def probe_accounts(
     client_timeout = aiohttp.ClientTimeout(total=max(1, timeout))
     sem = asyncio.Semaphore(max(1, workers))
 
-    out = []
     async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
-        tasks = [asyncio.create_task(probe_one(session, sem, item)) for item in refreshed_candidates]
-        for t in asyncio.as_completed(tasks):
-            out.append(await t)
+        out = await _run_bounded(
+            refreshed_candidates,
+            max(1, workers),
+            lambda item: probe_one(session, sem, item),
+        )
     return out
 
 
@@ -663,11 +693,12 @@ async def check_quota_accounts(
     client_timeout = aiohttp.ClientTimeout(total=max(1, timeout))
     sem = asyncio.Semaphore(max(1, workers))
 
-    out = []
     async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
-        tasks = [asyncio.create_task(quota_one(session, sem, item)) for item in refreshed_candidates]
-        for t in asyncio.as_completed(tasks):
-            out.append(await t)
+        out = await _run_bounded(
+            refreshed_candidates,
+            max(1, workers),
+            lambda item: quota_one(session, sem, item),
+        )
     return out
 
 
@@ -711,11 +742,12 @@ async def set_disabled_names(base_url, token, names, disabled, workers, timeout)
     client_timeout = aiohttp.ClientTimeout(total=max(1, timeout))
     sem = asyncio.Semaphore(max(1, workers))
 
-    out = []
     async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
-        tasks = [asyncio.create_task(set_one(session, sem, n)) for n in names]
-        for t in asyncio.as_completed(tasks):
-            out.append(await t)
+        out = await _run_bounded(
+            names,
+            max(1, workers),
+            lambda n: set_one(session, sem, n),
+        )
     return out
 
 
@@ -745,11 +777,12 @@ async def delete_names(base_url, token, names, delete_workers, timeout):
     client_timeout = aiohttp.ClientTimeout(total=max(1, timeout))
     sem = asyncio.Semaphore(max(1, delete_workers))
 
-    out = []
     async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
-        tasks = [asyncio.create_task(delete_one(session, sem, n)) for n in names]
-        for t in asyncio.as_completed(tasks):
-            out.append(await t)
+        out = await _run_bounded(
+            names,
+            max(1, delete_workers),
+            lambda n: delete_one(session, sem, n),
+        )
     return out
 
 

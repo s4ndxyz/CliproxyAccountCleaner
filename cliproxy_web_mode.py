@@ -579,7 +579,9 @@ class WebState:
         if not self.rows:
             self.refresh()
         rt = self._runtime(True)
-        c = self._cands(names, include_closed=rt["auto_fill"])
+        # 自动巡检主联合检测只扫描非关闭账号，避免在账号量大时一次性拉起海量任务。
+        # 已关闭账号的补位检测在 _auto_once 的“缺口补位”流程里按需执行。
+        c = self._cands(names, include_closed=False)
         if not c:
             return {"checked": 0, "invalid_401": 0, "invalid_quota": 0}
         refreshed = {}
@@ -589,12 +591,50 @@ class WebState:
                     refreshed[it.get("auth_index")] = it
         except Exception:
             refreshed = {}
-        p = asyncio.run(self.ns["probe_accounts"](rt["base"], rt["token"], c, rt["ua"], rt["chat_id"], rt["workers"], rt["timeout"], rt["retries"], refresh_candidates=False, refreshed_by_auth_index=refreshed))
-        q = asyncio.run(self.ns["check_quota_accounts"](rt["base"], rt["token"], c, rt["ua"], rt["chat_id"], rt["quota_workers"], rt["timeout"], rt["retries"], rt["weekly"], rt["primary"], refresh_candidates=False, refreshed_by_auth_index=refreshed))
-        self._apply_probe(p)
-        self._apply_quota(q)
-        bad401 = [x for x in p if x.get("invalid_401")]
-        badq = [x for x in q if x.get("invalid_quota")]
+
+        # 分块处理，避免 candidates 很大时一次性创建过多协程任务导致 CPU/内存冲高
+        chunk_size = max(1, min(len(c), max(1, max(rt["workers"], rt["quota_workers"]))))
+        all_probe = []
+        all_quota = []
+        for i in range(0, len(c), chunk_size):
+            chunk = c[i : i + chunk_size]
+            p = asyncio.run(
+                self.ns["probe_accounts"](
+                    rt["base"],
+                    rt["token"],
+                    chunk,
+                    rt["ua"],
+                    rt["chat_id"],
+                    rt["workers"],
+                    rt["timeout"],
+                    rt["retries"],
+                    refresh_candidates=False,
+                    refreshed_by_auth_index=refreshed,
+                )
+            )
+            q = asyncio.run(
+                self.ns["check_quota_accounts"](
+                    rt["base"],
+                    rt["token"],
+                    chunk,
+                    rt["ua"],
+                    rt["chat_id"],
+                    rt["quota_workers"],
+                    rt["timeout"],
+                    rt["retries"],
+                    rt["weekly"],
+                    rt["primary"],
+                    refresh_candidates=False,
+                    refreshed_by_auth_index=refreshed,
+                )
+            )
+            all_probe.extend(p)
+            all_quota.extend(q)
+            self._apply_probe(p)
+            self._apply_quota(q)
+
+        bad401 = [x for x in all_probe if x.get("invalid_401")]
+        badq = [x for x in all_quota if x.get("invalid_quota")]
         self.ns["write_json_file"](self._out_path(self.conf.get("output") or self.ns["DEFAULT_OUTPUT"]), bad401)
         self.ns["write_json_file"](self._out_path(self.conf.get("quota_output") or self.ns["DEFAULT_QUOTA_OUTPUT"]), badq)
         return {"checked": len(c), "invalid_401": len(bad401), "invalid_quota": len(badq)}

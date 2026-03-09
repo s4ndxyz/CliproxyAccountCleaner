@@ -246,7 +246,8 @@ class WebState:
         path = self.ns["Path"](p)
         if path.is_absolute():
             return path
-        return self.ns["Path"](self.ns["HERE"]) / p
+        base_dir = self.ns["Path"](self.config_path).resolve().parent if self.config_path else self.ns["Path"](self.ns["HERE"])
+        return base_dir / p
 
     def update_conf(self, data):
         if not isinstance(data, dict):
@@ -282,15 +283,103 @@ class WebState:
         return self._out_path(self.conf.get("standby_output") or self.ns["DEFAULT_STANDBY_OUTPUT"])
 
     def _load_standby(self):
-        p = self._standby_path()
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                self.standby = set(_names(json.load(f)))
-        except Exception:
-            self.standby = set()
+        with self.lock:
+            self._set_standby_locked(self._load_standby_names())
 
     def _save_standby(self):
-        self.ns["write_json_file"](self._standby_path(), sorted(self.standby))
+        with self.lock:
+            cleaned = self._set_standby_locked(self.standby)
+        self.ns["write_json_file"](self._standby_path(), sorted(cleaned))
+
+    def _load_standby_names(self):
+        names = set()
+        for item in self._load_standby_entries():
+            name = self._standby_entry_name(item)
+            if name:
+                names.add(name)
+        return names
+
+    def _load_standby_entries(self):
+        p = self._standby_path()
+        if not p.exists():
+            legacy = self.conf.get("standby_accounts") or []
+            if isinstance(legacy, list):
+                return list(legacy)
+            return []
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+        return []
+
+    def _standby_entry_name(self, item):
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+            if name:
+                return name
+            raw = item.get("raw")
+            if isinstance(raw, dict):
+                raw_name = str(raw.get("name") or "").strip()
+                if raw_name:
+                    return raw_name
+            return ""
+        return str(item or "").strip()
+
+    def _standby_entry_keys(self, item):
+        values = []
+        if isinstance(item, dict):
+            for key in ("name", "account", "email", "auth_index", "authIndex"):
+                values.append(item.get(key))
+            raw = item.get("raw")
+            if isinstance(raw, dict):
+                for key in ("name", "account", "email", "auth_index", "authIndex"):
+                    values.append(raw.get(key))
+        else:
+            values.append(item)
+        return {str(value).strip() for value in values if str(value or "").strip()}
+
+    def _resolve_standby_names_for_files(self, files):
+        standby_entries = self._load_standby_entries()
+        if not standby_entries:
+            return set()
+
+        standby_lookup = set()
+        for item in standby_entries:
+            standby_lookup.update(self._standby_entry_keys(item))
+        if not standby_lookup:
+            return set()
+
+        resolved = set()
+        for item in (files or []):
+            name = str((item or {}).get("name") or "").strip()
+            if not name:
+                continue
+            if self._standby_entry_keys(item) & standby_lookup:
+                resolved.add(name)
+        return resolved
+
+    def _set_standby_locked(self, names):
+        cleaned = {str(name).strip() for name in (names or set()) if str(name or "").strip()}
+        self.standby = cleaned
+        for row in self.rows:
+            row["standby"] = str(row.get("name") or "").strip() in cleaned
+        return cleaned
+
+    def _refresh_standby_for_files_locked(self, files):
+        return self._set_standby_locked(self._resolve_standby_names_for_files(files))
+
+    def _refresh_standby_from_rows_locked(self):
+        files = []
+        for row in self.rows:
+            raw = row.get("raw")
+            if isinstance(raw, dict):
+                files.append(raw)
+        if files:
+            return self._refresh_standby_for_files_locked(files)
+        return self._set_standby_locked(self._load_standby_names())
 
     def _bucket(self, a):
         if a.get("invalid_401"):
@@ -344,6 +433,7 @@ class WebState:
         files = self.ns["fetch_auth_files"](rt["base"], rt["token"], rt["timeout"])
         with self.lock:
             old = {x.get("name"): x for x in self.rows if x.get("name")}
+            self._refresh_standby_for_files_locked(files)
             out = []
             for raw in files:
                 n = str(raw.get("name") or "").strip()
@@ -360,6 +450,7 @@ class WebState:
         rt = self._runtime(False)
         out = []
         with self.lock:
+            self._refresh_standby_from_rows_locked()
             for a in self.rows:
                 if wanted and a.get("name") not in wanted:
                     continue
@@ -725,6 +816,8 @@ class WebState:
         ret = asyncio.run(self.ns["enable_names"](rt["base"], rt["token"], n, rt["enable_workers"], rt["timeout"]))
         ok = {x.get("name") for x in ret if x.get("updated")}
         with self.lock:
+            if drop_standby:
+                self._refresh_standby_from_rows_locked()
             for a in self.rows:
                 if a.get("name") in ok:
                     a["disabled"] = False
@@ -745,6 +838,7 @@ class WebState:
         n = _names(names)
         add = 0
         with self.lock:
+            self._refresh_standby_from_rows_locked()
             for x in n:
                 if x not in self.standby:
                     self.standby.add(x)
@@ -759,6 +853,7 @@ class WebState:
         n = _names(names)
         rm = 0
         with self.lock:
+            self._refresh_standby_from_rows_locked()
             for x in n:
                 if x in self.standby:
                     self.standby.remove(x)
@@ -775,6 +870,8 @@ class WebState:
 
         rt = self._runtime(True)
         files = self.ns["fetch_auth_files"](rt["base"], rt["token"], rt["timeout"])
+        with self.lock:
+            self._refresh_standby_for_files_locked(files)
         candidates = self._collect_standby_candidates(files, rt)
         selected_set = set(selected)
         candidates = [x for x in candidates if str(x.get("name") or "").strip() in selected_set]
@@ -842,6 +939,8 @@ class WebState:
         rt = self._runtime(True)
         selected = set(_names(names))
         files = self.ns["fetch_auth_files"](rt["base"], rt["token"], rt["timeout"])
+        with self.lock:
+            self._refresh_standby_for_files_locked(files)
         closed = self._collect_closed_candidates(files, rt)
         if selected:
             closed = [x for x in closed if str(x.get("name") or "").strip() in selected]
@@ -890,6 +989,7 @@ class WebState:
         ret = asyncio.run(self.ns["delete_names"](rt["base"], rt["token"], n, rt["delete_workers"], rt["timeout"]))
         ok = {x.get("name") for x in ret if x.get("deleted")}
         with self.lock:
+            self._refresh_standby_from_rows_locked()
             self.rows = [x for x in self.rows if x.get("name") not in ok]
             self.standby = {x for x in self.standby if x not in ok}
         self._save_standby()
@@ -944,6 +1044,8 @@ class WebState:
             refill_need = max(0, target - active_after_overflow)
             if refill_need > 0:
                 files = self.ns["fetch_auth_files"](rt["base"], rt["token"], rt["timeout"])
+                with self.lock:
+                    self._refresh_standby_for_files_locked(files)
 
                 standby_candidates = self._collect_standby_candidates(files, rt)
                 standby_scan = self._scan_for_recovery(rt, standby_candidates, need_count=refill_need)
@@ -1190,7 +1292,7 @@ class AuthManager:
 WEB_PAGE = r"""<!doctype html>
 <html lang="zh-CN"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CliproxyAccountCleaner v1.3.3</title>
+<title>CliproxyAccountCleaner v1.4.0</title>
 <style>
 :root{--bg:#fff4f9;--panel:#fffafc;--line:#efbfd3;--line2:#f6d7e5;--btn:#ff78ac;--btn2:#ff5a98;--text:#5a3146;--thead:#ffe7f2}
 *{box-sizing:border-box}html,body{height:100%}body{margin:0;background:radial-gradient(circle at 10% -10%,#ffe8f2 0,#fff4f9 40%,#ffeef6 100%);color:var(--text);font-family:"Microsoft YaHei","Segoe UI",Tahoma,sans-serif;font-size:14px}
